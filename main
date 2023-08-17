@@ -1,0 +1,344 @@
+library(tidyverse)
+library(caret)
+library(magrittr)
+data <- EmpowerStatsR %>% data.frame(row.names = NULL)
+data[is.na(data)] = 0
+count_data.all <- data %>% dplyr::select(SEQN, WAIST_CIRCUMFERENCE, WEIGHT,WWI, BMI, AGE,GENDER, RACE, EDULEVEL, SMOKE, DIABETES, CFASTAT_CUTOFF) %>% 
+  column_to_rownames("SEQN") %>% dplyr::rename(Group = CFASTAT_CUTOFF) %>% 
+  mutate(group = factor(Group)) %>% dplyr::select(-Group)
+
+meta <- count_data.all %>% dplyr::select(group) %>% data.frame(ID = rownames(.),.)
+
+trControl <- trainControl(method="repeatedcv", number=10, repeats=20, verboseIter = T, allowParallel = T)
+sam.idx <- createDataPartition(y = data$CFASTAT_CUTOFF, p = 0.75,  list = F)
+GC_train_group <- meta[sam.idx,]
+GC_train_data <- count_data.all[rownames(count_data.all)%in%GC_train_group$ID,]
+
+GC_test_group <- meta[-sam.idx,]
+GC_test_data <- count_data.all[rownames(count_data.all)%in%GC_test_group$ID,]
+
+# 下采样
+down_train <- downSample(x = GC_train_data[, -ncol(GC_train_data)],
+                         y = GC_train_data$group)
+# 上采样
+up_train <- upSample(x = GC_train_data[, -ncol(GC_train_data)],
+                     y = GC_train_data$group)
+# SMOTE
+# smote_train <- SMOTE(group ~ ., data = GC_train_data)
+
+
+set.seed(seed)
+down_train <- downSample(x = GC_train_data[, -ncol(GC_train_data)],
+                         y = GC_train_data$group)
+# 上采样
+set.seed(seed)
+up_train <- upSample(x = GC_train_data[, -ncol(GC_train_data)],
+                     y = GC_train_data$group)
+
+# 训练随机森林模型
+#######################
+# doParallel::registerDoParallel(6)
+tree = 1000
+seed = 456
+set.seed(seed)
+model_rf_down <- train(Class ~ ., data = down_train, method="rf", 
+                       metric="Accuracy", #metric='Kappa'
+                       ntree=tree,
+                       trControl=trControl)
+
+set.seed(seed)
+model_rf_up <- train(Class ~ ., data = up_train, method="rf", 
+                     metric="Accuracy", #metric='Kappa'
+                     ntree=tree,
+                     trControl=trControl)
+
+model_rf_smote=model_rf_up
+
+# 预测测试集并计算AUC
+pred_down <- predict(model_rf_down, GC_test_data, type = "prob")[,"0"]
+auc_down <- pROC::auc(pROC::roc(GC_test_data$group, pred_down))
+
+pred_up <- predict(model_rf_up, GC_test_data, type = "prob")[, "0"]
+auc_up <- pROC::auc(pROC::roc(GC_test_data$group, pred_up))
+pROC::ggroc(pROC::roc(GC_test_data$group, pred_up))
+
+pred_smote_GC_rf <- predict(model_rf_smote, GC_test_data[,-ncol(GC_test_data)], type = "prob")[, "0"]
+pred_smote <- predict(model_rf_smote, GC_test_data[,-ncol(GC_test_data)], type = "prob")[, "0"]
+auc_smote <- pROC::auc(pROC::roc(GC_test_data$group, pred_smote))
+
+# 输出结果
+cat("AUC using down-sampling:", auc_down, "\n")
+cat("AUC using up-sampling:", auc_up, "\n")
+cat("AUC using SMOTE:", auc_smote)
+
+Single_ROC_plot <- function(roc_curve){
+  library(pROC)
+  ROC_data <- data.frame(FPR = 1- roc_curve$specificities, TPR=roc_curve$sensitivities)
+  ROC_data <- ROC_data[with(ROC_data, order(FPR,TPR)),]
+  
+  best_thresh <- data.frame(coords(roc=roc_curve, x = "best", input="threshold", 
+                                   transpose = F, best.method = "youden"))
+  
+  best_thresh$best <- apply(best_thresh, 1, function (x) 
+    paste0( x[1], ' (', round(1-x[2],3), ", ", round(x[3],3), ")"))
+  ROC_data$testcohort <- "Test Set"
+  ROC_data_plot <- data.frame(ROC_data)
+  
+  best_thresh$testcohort <- "Test Set"
+  best_thresh_plot <- data.frame(best_thresh)
+  
+  ggplot(data = ROC_data_plot,mapping = aes(x=FPR, y=TPR,color=testcohort))+
+    geom_step(linewidth=1, direction = "vh")+
+    geom_segment(aes(x=0, xend=1, y=0, yend=1),color="black", size = .75, linetype=2)  +
+    xlab("1 - Specificity (FPR)") + 
+    ylab("Sensitivity (TPR)") +
+    coord_fixed(1) + 
+    xlim(0,1) + 
+    ylim(0,1) +
+    annotate('text', x=0.90, y=0.05, size = 3, label=paste('AUC =', round(roc_curve$auc,2)))+
+    scale_color_manual(values = "#46bbc0") +
+    theme_classic()+
+    theme(panel.border = element_rect(colour = "black", fill=NA)) +
+    theme(text = element_text(family="", face="bold"),
+          plot.title = element_text(hjust = 0.5, face="bold", size=15),
+          axis.title.y = element_text(size=12,face = "italic"),
+          axis.title.x = element_text(size=12,face = "italic"),
+          axis.text = element_text(size=10, color="black"),
+          legend.position = c(0.80,0.15),
+          legend.title = element_blank(),
+          legend.background = element_blank(),
+          legend.key.size = unit(2,"line"))
+}
+ROC.all <- Single_ROC_plot(pROC::roc(GC_test_data$group, pred_smote)) + labs(title = "BMI + WWI")
+
+##### BMI alone #####
+data <- EmpowerStatsR %>% data.frame(row.names = NULL)
+data[is.na(data)] = 0
+count_data.all <- data %>% dplyr::select(SEQN, BMI, AGE,GENDER, RACE, EDULEVEL, SMOKE, DIABETES, CFASTAT_CUTOFF) %>% 
+  column_to_rownames("SEQN") %>% dplyr::rename(Group = CFASTAT_CUTOFF) %>% 
+  mutate(group = factor(Group)) %>% dplyr::select(-Group)
+
+meta <- count_data.all %>% dplyr::select(group) %>% data.frame(ID = rownames(.),.)
+
+trControl <- trainControl(method="repeatedcv", number=10, repeats=20, verboseIter = T, allowParallel = T)
+sam.idx <- createDataPartition(y = data$CFASTAT_CUTOFF, p = 0.75,  list = F)
+GC_train_group <- meta[sam.idx,]
+GC_train_data <- count_data.all[rownames(count_data.all)%in%GC_train_group$ID,]
+
+GC_test_group <- meta[-sam.idx,]
+GC_test_data <- count_data.all[rownames(count_data.all)%in%GC_test_group$ID,]
+
+# 下采样
+down_train <- downSample(x = GC_train_data[, -ncol(GC_train_data)],
+                         y = GC_train_data$group)
+# 上采样
+up_train <- upSample(x = GC_train_data[, -ncol(GC_train_data)],
+                     y = GC_train_data$group)
+
+
+set.seed(seed)
+down_train <- downSample(x = GC_train_data[, -ncol(GC_train_data)],
+                         y = GC_train_data$group)
+# 上采样
+set.seed(seed)
+up_train <- upSample(x = GC_train_data[, -ncol(GC_train_data)],
+                     y = GC_train_data$group)
+
+# 训练随机森林模型
+#######################
+# doParallel::registerDoParallel(6)
+tree = 1000
+seed = 456
+set.seed(seed)
+model_rf_down <- train(Class ~ ., data = down_train, method="rf", 
+                       metric="Accuracy", #metric='Kappa'
+                       ntree=tree,
+                       trControl=trControl)
+
+set.seed(seed)
+model_rf_up <- train(Class ~ ., data = up_train, method="rf", 
+                     metric="Accuracy", #metric='Kappa'
+                     ntree=tree,
+                     trControl=trControl)
+
+model_rf_smote=model_rf_up
+
+# 预测测试集并计算AUC
+pred_down <- predict(model_rf_down, GC_test_data, type = "prob")[,"0"]
+auc_down <- pROC::auc(pROC::roc(GC_test_data$group, pred_down))
+
+pred_up <- predict(model_rf_up, GC_test_data, type = "prob")[, "0"]
+auc_up <- pROC::auc(pROC::roc(GC_test_data$group, pred_up))
+pROC::ggroc(pROC::roc(GC_test_data$group, pred_up))
+
+pred_smote_GC_rf <- predict(model_rf_smote, GC_test_data[,-ncol(GC_test_data)], type = "prob")[, "0"]
+pred_smote <- predict(model_rf_smote, GC_test_data[,-ncol(GC_test_data)], type = "prob")[, "0"]
+auc_smote <- pROC::auc(pROC::roc(GC_test_data$group, pred_smote))
+
+# 输出结果
+cat("AUC using down-sampling:", auc_down, "\n")
+cat("AUC using up-sampling:", auc_up, "\n")
+cat("AUC using SMOTE:", auc_smote)
+
+Single_ROC_plot <- function(roc_curve){
+  library(pROC)
+  ROC_data <- data.frame(FPR = 1- roc_curve$specificities, TPR=roc_curve$sensitivities)
+  ROC_data <- ROC_data[with(ROC_data, order(FPR,TPR)),]
+  
+  best_thresh <- data.frame(coords(roc=roc_curve, x = "best", input="threshold", 
+                                   transpose = F, best.method = "youden"))
+  
+  best_thresh$best <- apply(best_thresh, 1, function (x) 
+    paste0( x[1], ' (', round(1-x[2],3), ", ", round(x[3],3), ")"))
+  ROC_data$testcohort <- "Test Set"
+  ROC_data_plot <- data.frame(ROC_data)
+  
+  best_thresh$testcohort <- "Test Set"
+  best_thresh_plot <- data.frame(best_thresh)
+  
+  ggplot(data = ROC_data_plot,mapping = aes(x=FPR, y=TPR,color=testcohort))+
+    geom_step(linewidth=1, direction = "vh")+
+    geom_segment(aes(x=0, xend=1, y=0, yend=1),color="black", size = .75, linetype=2)  +
+    xlab("1 - Specificity (FPR)") + 
+    ylab("Sensitivity (TPR)") +
+    coord_fixed(1) + 
+    xlim(0,1) + 
+    ylim(0,1) +
+    annotate('text', x=0.90, y=0.05, size = 3, label=paste('AUC =', round(roc_curve$auc,2)))+
+    scale_color_manual(values = "#46bbc0") +
+    theme_classic()+
+    theme(panel.border = element_rect(colour = "black", fill=NA)) +
+    theme(text = element_text(family="", face="bold"),
+          plot.title = element_text(hjust = 0.5, face="bold", size=15),
+          axis.title.y = element_text(size=12,face = "italic"),
+          axis.title.x = element_text(size=12,face = "italic"),
+          axis.text = element_text(size=10, color="black"),
+          legend.position = c(0.80,0.15),
+          legend.title = element_blank(),
+          legend.background = element_blank(),
+          legend.key.size = unit(2,"line"))
+}
+ROC.bmi <- Single_ROC_plot(pROC::roc(GC_test_data$group, pred_smote)) + labs(title = "BMI")
+
+
+##### WWI alone #####
+data <- EmpowerStatsR %>% data.frame(row.names = NULL)
+data[is.na(data)] = 0
+count_data.all <- data %>% dplyr::select(SEQN, WWI, AGE,GENDER, RACE, EDULEVEL, SMOKE, DIABETES, CFASTAT_CUTOFF) %>% 
+  column_to_rownames("SEQN") %>% dplyr::rename(Group = CFASTAT_CUTOFF) %>% 
+  mutate(group = factor(Group)) %>% dplyr::select(-Group)
+
+meta <- count_data.all %>% dplyr::select(group) %>% data.frame(ID = rownames(.),.)
+
+trControl <- trainControl(method="repeatedcv", number=10, repeats=20, verboseIter = T, allowParallel = T)
+sam.idx <- createDataPartition(y = data$CFASTAT_CUTOFF, p = 0.75,  list = F)
+GC_train_group <- meta[sam.idx,]
+GC_train_data <- count_data.all[rownames(count_data.all)%in%GC_train_group$ID,]
+
+GC_test_group <- meta[-sam.idx,]
+GC_test_data <- count_data.all[rownames(count_data.all)%in%GC_test_group$ID,]
+
+# 下采样
+down_train <- downSample(x = GC_train_data[, -ncol(GC_train_data)],
+                         y = GC_train_data$group)
+# 上采样
+up_train <- upSample(x = GC_train_data[, -ncol(GC_train_data)],
+                     y = GC_train_data$group)
+
+set.seed(seed)
+down_train <- downSample(x = GC_train_data[, -ncol(GC_train_data)],
+                         y = GC_train_data$group)
+# 上采样
+set.seed(seed)
+up_train <- upSample(x = GC_train_data[, -ncol(GC_train_data)],
+                     y = GC_train_data$group)
+# SMOTE
+set.seed(seed)
+# smote_train <- SMOTE(group ~ ., data = GC_train_data)
+
+# 训练随机森林模型
+#######################
+# doParallel::registerDoParallel(6)
+tree = 1200
+seed = 456
+set.seed(seed)
+model_rf_down <- train(Class ~ ., data = down_train, method="rf", 
+                       metric="Accuracy", #metric='Kappa'
+                       ntree=tree,
+                       trControl=trControl)
+
+set.seed(seed)
+model_rf_up <- train(Class ~ ., data = up_train, method="rf", 
+                     metric="Accuracy", #metric='Kappa'
+                     ntree=tree,
+                     trControl=trControl)
+
+model_rf_smote=model_rf_up
+
+# 预测测试集并计算AUC
+pred_down <- predict(model_rf_down, GC_test_data, type = "prob")[,"0"]
+auc_down <- pROC::auc(pROC::roc(GC_test_data$group, pred_down))
+
+pred_up <- predict(model_rf_up, GC_test_data, type = "prob")[, "0"]
+auc_up <- pROC::auc(pROC::roc(GC_test_data$group, pred_up))
+pROC::ggroc(pROC::roc(GC_test_data$group, pred_up))
+
+pred_smote_GC_rf <- predict(model_rf_smote, GC_test_data[,-ncol(GC_test_data)], type = "prob")[, "0"]
+pred_smote <- predict(model_rf_smote, GC_test_data[,-ncol(GC_test_data)], type = "prob")[, "0"]
+auc_smote <- pROC::auc(pROC::roc(GC_test_data$group, pred_smote))
+
+# 输出结果
+cat("AUC using down-sampling:", auc_down, "\n")
+cat("AUC using up-sampling:", auc_up, "\n")
+cat("AUC using SMOTE:", auc_smote)
+
+Single_ROC_plot <- function(roc_curve){
+  library(pROC)
+  ROC_data <- data.frame(FPR = 1- roc_curve$specificities, TPR=roc_curve$sensitivities)
+  ROC_data <- ROC_data[with(ROC_data, order(FPR,TPR)),]
+  
+  best_thresh <- data.frame(coords(roc=roc_curve, x = "best", input="threshold", 
+                                   transpose = F, best.method = "youden"))
+  
+  best_thresh$best <- apply(best_thresh, 1, function (x) 
+    paste0( x[1], ' (', round(1-x[2],3), ", ", round(x[3],3), ")"))
+  ROC_data$testcohort <- "Test Set"
+  ROC_data_plot <- data.frame(ROC_data)
+  
+  best_thresh$testcohort <- "Test Set"
+  best_thresh_plot <- data.frame(best_thresh)
+  
+  ggplot(data = ROC_data_plot,mapping = aes(x=FPR, y=TPR,color=testcohort))+
+    geom_step(linewidth=1, direction = "vh")+
+    geom_segment(aes(x=0, xend=1, y=0, yend=1),color="black", size = .75, linetype=2)  +
+    xlab("1 - Specificity (FPR)") + 
+    ylab("Sensitivity (TPR)") +
+    coord_fixed(1) + 
+    xlim(0,1) + 
+    ylim(0,1) +
+    annotate('text', x=0.90, y=0.05, size = 3, label=paste('AUC =', round(roc_curve$auc,2)))+
+    scale_color_manual(values = "#46bbc0") +
+    theme_classic()+
+    theme(panel.border = element_rect(colour = "black", fill=NA)) +
+    theme(text = element_text(family="", face="bold"),
+          plot.title = element_text(hjust = 0.5, face="bold", size=15),
+          axis.title.y = element_text(size=12,face = "italic"),
+          axis.title.x = element_text(size=12,face = "italic"),
+          axis.text = element_text(size=10, color="black"),
+          legend.position = c(0.80,0.15),
+          legend.title = element_blank(),
+          legend.background = element_blank(),
+          legend.key.size = unit(2,"line"))
+}
+ROC.wwi <- Single_ROC_plot(pROC::roc(GC_test_data$group, pred_smote)) + labs(title = "WWI")
+
+ROC.bmi
+
+ROC.wwi
+
+ROC.all
+
+ROC.done <- ROC.bmi + ROC.wwi + ROC.all
+
+setwd(/Users/jhkuang/Desktop)
+ggsave(plot = ROC.done, filename = "ROC_WWI.pdf", units = "cm", width = 21, height = 6, path = "/Users/jhkuang/Desktop")
